@@ -1,6 +1,249 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <termios.h>
+#include <unistd.h>
+#include <sys/select.h>
+#include <sys/time.h>
+
+/* ============================================================
+                        BINARY TETRIS
+   ============================================================ */
+
+#define TW 10
+#define TH 20
+
+static const int TETRIS_SHAPES[7][4][4][4] = {
+    /* I */ {
+        {{0,0,0,0},{1,1,1,1},{0,0,0,0},{0,0,0,0}},
+        {{0,0,1,0},{0,0,1,0},{0,0,1,0},{0,0,1,0}},
+        {{0,0,0,0},{0,0,0,0},{1,1,1,1},{0,0,0,0}},
+        {{0,1,0,0},{0,1,0,0},{0,1,0,0},{0,1,0,0}} },
+    /* O */ {
+        {{1,1,0,0},{1,1,0,0},{0,0,0,0},{0,0,0,0}},
+        {{1,1,0,0},{1,1,0,0},{0,0,0,0},{0,0,0,0}},
+        {{1,1,0,0},{1,1,0,0},{0,0,0,0},{0,0,0,0}},
+        {{1,1,0,0},{1,1,0,0},{0,0,0,0},{0,0,0,0}} },
+    /* T */ {
+        {{0,1,0,0},{1,1,1,0},{0,0,0,0},{0,0,0,0}},
+        {{0,1,0,0},{0,1,1,0},{0,1,0,0},{0,0,0,0}},
+        {{0,0,0,0},{1,1,1,0},{0,1,0,0},{0,0,0,0}},
+        {{0,1,0,0},{1,1,0,0},{0,1,0,0},{0,0,0,0}} },
+    /* S */ {
+        {{0,1,1,0},{1,1,0,0},{0,0,0,0},{0,0,0,0}},
+        {{0,1,0,0},{0,1,1,0},{0,0,1,0},{0,0,0,0}},
+        {{0,0,0,0},{0,1,1,0},{1,1,0,0},{0,0,0,0}},
+        {{1,0,0,0},{1,1,0,0},{0,1,0,0},{0,0,0,0}} },
+    /* Z */ {
+        {{1,1,0,0},{0,1,1,0},{0,0,0,0},{0,0,0,0}},
+        {{0,0,1,0},{0,1,1,0},{0,1,0,0},{0,0,0,0}},
+        {{0,0,0,0},{1,1,0,0},{0,1,1,0},{0,0,0,0}},
+        {{0,1,0,0},{1,1,0,0},{1,0,0,0},{0,0,0,0}} },
+    /* J */ {
+        {{1,0,0,0},{1,1,1,0},{0,0,0,0},{0,0,0,0}},
+        {{0,1,1,0},{0,1,0,0},{0,1,0,0},{0,0,0,0}},
+        {{0,0,0,0},{1,1,1,0},{0,0,1,0},{0,0,0,0}},
+        {{0,1,0,0},{0,1,0,0},{1,1,0,0},{0,0,0,0}} },
+    /* L */ {
+        {{0,0,1,0},{1,1,1,0},{0,0,0,0},{0,0,0,0}},
+        {{0,1,0,0},{0,1,0,0},{0,1,1,0},{0,0,0,0}},
+        {{0,0,0,0},{1,1,1,0},{1,0,0,0},{0,0,0,0}},
+        {{1,1,0,0},{0,1,0,0},{0,1,0,0},{0,0,0,0}} }
+};
+
+static long long now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+}
+
+static int read_char_timeout(int ms) {
+    struct timeval tv;
+    tv.tv_sec  = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
+        char c;
+        if (read(STDIN_FILENO, &c, 1) == 1) return (unsigned char)c;
+    }
+    return -1;
+}
+
+static int t_collide(int board[TH][TW], const int shape[4][4], int px, int py) {
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++)
+            if (shape[y][x]) {
+                int bx = px + x, by = py + y;
+                if (bx < 0 || bx >= TW) return 1;
+                if (by >= TH) return 1;
+                if (by >= 0 && board[by][bx]) return 1;
+            }
+    return 0;
+}
+
+static void t_lock(int board[TH][TW], const int shape[4][4], int px, int py) {
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++)
+            if (shape[y][x]) {
+                int bx = px + x, by = py + y;
+                if (bx >= 0 && bx < TW && by >= 0 && by < TH)
+                    board[by][bx] = 1;
+            }
+}
+
+static int t_clear_lines(int board[TH][TW]) {
+    int cleared = 0;
+    for (int y = TH - 1; y >= 0; ) {
+        int full = 1;
+        for (int x = 0; x < TW; x++)
+            if (!board[y][x]) { full = 0; break; }
+        if (full) {
+            for (int yy = y; yy > 0; yy--)
+                memcpy(board[yy], board[yy - 1], sizeof(board[yy]));
+            memset(board[0], 0, sizeof(board[0]));
+            cleared++;
+        } else {
+            y--;
+        }
+    }
+    return cleared;
+}
+
+static void play_tetris(void) {
+    struct termios orig, raw;
+    tcgetattr(STDIN_FILENO, &orig);
+    raw = orig;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_iflag &= ~(IXON | ICRNL);
+    raw.c_cc[VMIN]  = 0;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+
+    printf("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+    fflush(stdout);
+
+    srand((unsigned)time(NULL));
+
+    int board[TH][TW];
+    memset(board, 0, sizeof(board));
+
+    int score = 0, game_over = 0, running = 1;
+    int cur_type = rand() % 7, cur_rot = 0;
+    int cur_x = 3, cur_y = 0;
+
+    long long last_drop = now_ms();
+    long long drop_interval = 800;
+
+    while (running && !game_over) {
+        int c;
+        while ((c = read_char_timeout(0)) >= 0) {
+            if (c == 27) {
+                int c2 = read_char_timeout(20);
+                if (c2 == '[') {
+                    int c3 = read_char_timeout(20);
+                    if (c3 == 'A') {
+                        int nr = (cur_rot + 1) % 4;
+                        if (!t_collide(board, TETRIS_SHAPES[cur_type][nr], cur_x, cur_y))
+                            cur_rot = nr;
+                    } else if (c3 == 'B') {
+                        if (!t_collide(board, TETRIS_SHAPES[cur_type][cur_rot], cur_x, cur_y + 1))
+                            cur_y++;
+                    } else if (c3 == 'C') {
+                        if (!t_collide(board, TETRIS_SHAPES[cur_type][cur_rot], cur_x + 1, cur_y))
+                            cur_x++;
+                    } else if (c3 == 'D') {
+                        if (!t_collide(board, TETRIS_SHAPES[cur_type][cur_rot], cur_x - 1, cur_y))
+                            cur_x--;
+                    }
+                } else if (c2 < 0) {
+                    running = 0;
+                }
+            } else if (c == 'q' || c == 'Q') {
+                running = 0;
+            } else if (c == ' ') {
+                while (!t_collide(board, TETRIS_SHAPES[cur_type][cur_rot], cur_x, cur_y + 1))
+                    cur_y++;
+            }
+        }
+        if (!running) break;
+
+        long long now = now_ms();
+        if (now - last_drop >= drop_interval) {
+            last_drop = now;
+            const int (*shape)[4] = TETRIS_SHAPES[cur_type][cur_rot];
+            if (!t_collide(board, shape, cur_x, cur_y + 1)) {
+                cur_y++;
+            } else {
+                t_lock(board, shape, cur_x, cur_y);
+                int lines = t_clear_lines(board);
+                if (lines > 0) {
+                    score += (lines == 1) ? 100
+                           : (lines == 2) ? 300
+                           : (lines == 3) ? 500 : 800;
+                    if (drop_interval > 120) drop_interval -= lines * 40;
+                }
+                cur_type = rand() % 7;
+                cur_rot  = 0;
+                cur_x    = 3;
+                cur_y    = 0;
+                if (t_collide(board, TETRIS_SHAPES[cur_type][0], cur_x, cur_y))
+                    game_over = 1;
+            }
+        }
+
+        /* --- render --- */
+        printf("\x1b[H");
+        printf("========== BINARY TETRIS ==========\n");
+        printf("Score: %-6d  Speed: %lldms\n\n", score, drop_interval);
+        printf("+----------+\n");
+
+        const int (*shape)[4] = TETRIS_SHAPES[cur_type][cur_rot];
+        for (int y = 0; y < TH; y++) {
+            printf("|");
+            for (int x = 0; x < TW; x++) {
+                int sy = y - cur_y, sx = x - cur_x;
+                int falling = (sy >= 0 && sy < 4 && sx >= 0 && sx < 4 && shape[sy][sx]);
+                if (falling) {
+                    char ch = ((sy + sx) & 1) ? '1' : '0';
+                    printf("\x1b[1;32m%c\x1b[0m", ch);
+                } else if (board[y][x]) {
+                    char ch = ((x + y) & 1) ? '1' : '0';
+                    printf("\x1b[36m%c\x1b[0m", ch);
+                } else {
+                    printf(" ");
+                }
+            }
+            printf("|\n");
+        }
+        printf("+----------+\n");
+        printf("\nArrows: move/rotate | SPACE: drop | Q: quit\n");
+        fflush(stdout);
+
+        usleep(16000);
+    }
+
+    printf("\x1b[2J\x1b[H");
+    if (game_over) printf("========== GAME OVER ==========\n\n");
+    else           printf("========== QUIT ==========\n\n");
+    printf("Score: %d\n\n", score);
+    printf("Press any key to return to menu...\n");
+    fflush(stdout);
+
+    tcflush(STDIN_FILENO, TCIFLUSH);
+    char dummy;
+    while (read(STDIN_FILENO, &dummy, 1) != 1) usleep(50000);
+    tcflush(STDIN_FILENO, TCIFLUSH);
+
+    printf("\x1b[?25h\x1b[?1049l");
+    fflush(stdout);
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
+}
+
+/* ============================================================
+                        MAIN PROGRAM
+   ============================================================ */
 
 int main(void) {
     int choice;
@@ -37,6 +280,7 @@ int main(void) {
         printf("9. How programs work\n");
         printf("10. Binary Playground\n");
         printf("11. Final Challenge\n");
+        printf("12. Binary Tetris\n");
         printf("0. Exit\n\n");
 
         printf("Choose: ");
@@ -80,7 +324,7 @@ int main(void) {
                 printf("moves through billions of tiny transistors.\n");
 
                 break;
-                
+
             case 2:
                 printf(
                 "0000000000000000000000000        111111111\n"
@@ -106,7 +350,7 @@ int main(void) {
                 );
                 printf("\nBinary code is a way to store information using only 0 and 1.\n");
                 break;
-                
+
             case 3:
                 printf(
                 "101101        45\n"
@@ -150,7 +394,7 @@ int main(void) {
                 printf("101101(binary)\n");
 
                 break;
-                
+
             case 4:
                 printf(
                 " _____\n"
@@ -163,7 +407,7 @@ int main(void) {
                 );
                 printf("\nA transistor is a tiny electronic switch. It can be ON (1) or OFF (0).\n");
                 break;
-                
+
             case 5:
                 printf(
                 "      A ----\\\n"
@@ -226,7 +470,7 @@ int main(void) {
                 printf("calculators, memory, and entire processors.\n");
 
                 break;
-                
+
             case 6:
                 printf(
                 "+---+---+---+---+---+---+---+---+\n"
@@ -281,7 +525,7 @@ int main(void) {
                 printf("are changed or deleted.\n");
 
                 break;
-                
+
             case 7:
                 printf(
                 "      HALF ADDER\n\n"
@@ -351,7 +595,7 @@ int main(void) {
                 printf("uses this basic idea.\n");
 
                 break;
-                
+
             case 8:
                 printf(
                 "+------------+     ♪♫♪      27 + 15 = 42\n"
@@ -365,7 +609,7 @@ int main(void) {
                 );
                 printf("\nEvery image, sound and calculation is ultimately represented as billions of 0s and 1s.\n");
                 break;
-                
+
             case 9:
                 printf(
                 "      Source Code\n"
@@ -437,9 +681,9 @@ int main(void) {
                 printf("machine instructions.\n");
 
                 break;
-                
+
             case 10:
-                
+
             while (1)
             {
                 int temp;
@@ -492,18 +736,18 @@ int main(void) {
             }
 
             break;
-                
+
             case 11:
-                
-            score=0;
+
+            score = 0;
 
             printf("========== FINAL CHALLENGE ==========\n\n");
 
             printf("Question 1\n");
             printf("Convert 45 to binary:\n> ");
-            scanf("%64s",answer);
+            scanf("%64s", answer);
 
-            if(strcmp(answer,"101101")==0)
+            if (strcmp(answer, "101101") == 0)
             {
                 printf("Correct!\n\n");
                 score++;
@@ -515,9 +759,9 @@ int main(void) {
 
             printf("Question 2\n");
             printf("Convert 1101 to decimal:\n> ");
-            scanf("%d",&result);
+            scanf("%d", &result);
 
-            if(result==13)
+            if (result == 13)
             {
                 printf("Correct!\n\n");
                 score++;
@@ -529,9 +773,9 @@ int main(void) {
 
             printf("Question 3\n");
             printf("1 AND 1 = ?\n> ");
-            scanf("%d",&result);
+            scanf("%d", &result);
 
-            if(result==1)
+            if (result == 1)
             {
                 printf("Correct!\n\n");
                 score++;
@@ -543,9 +787,9 @@ int main(void) {
 
             printf("Question 4\n");
             printf("1 XOR 1 = ?\n> ");
-            scanf("%d",&result);
+            scanf("%d", &result);
 
-            if(result==0)
+            if (result == 0)
             {
                 printf("Correct!\n\n");
                 score++;
@@ -557,9 +801,9 @@ int main(void) {
 
             printf("Question 5\n");
             printf("How many bits are in one byte?\n> ");
-            scanf("%d",&result);
+            scanf("%d", &result);
 
-            if(result==8)
+            if (result == 8)
             {
                 printf("Correct!\n\n");
                 score++;
@@ -570,19 +814,23 @@ int main(void) {
             }
 
             printf("=====================================\n");
-            printf("Your score: %d / 5\n",score);
+            printf("Your score: %d / 5\n", score);
 
-            if(score==5)
+            if (score == 5)
                 printf("Excellent!\n");
 
-            else if(score>=3)
+            else if (score >= 3)
                 printf("Good job!\n");
 
             else
                 printf("Try again!\n");
 
             break;
-                
+
+            case 12:
+                play_tetris();
+                continue;   /* terminal уже восстановлен — не ждём двойной Enter */
+
             case 0:
                 printf(
                 " __  __ _    _ ______ ______ _____ _   _  _____ \n"
