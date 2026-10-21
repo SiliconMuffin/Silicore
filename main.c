@@ -1,10 +1,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <termios.h>
-#include <unistd.h>
-#include <sys/select.h>
-#include <sys/time.h>
+#include <time.h>
+#include <conio.h>
+#include <windows.h>
+
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
 
 /* ============================================================
                         BINARY TETRIS
@@ -52,21 +55,24 @@ static const int TETRIS_SHAPES[7][4][4][4] = {
 };
 
 static long long now_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+    return (long long)GetTickCount64();
+}
+
+static void enable_ansi(void) {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut == INVALID_HANDLE_VALUE) return;
+    DWORD mode = 0;
+    if (!GetConsoleMode(hOut, &mode)) return;
+    mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    SetConsoleMode(hOut, mode);
+    SetConsoleOutputCP(CP_UTF8);
 }
 
 static int read_char_timeout(int ms) {
-    struct timeval tv;
-    tv.tv_sec  = ms / 1000;
-    tv.tv_usec = (ms % 1000) * 1000;
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(STDIN_FILENO, &fds);
-    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
-        char c;
-        if (read(STDIN_FILENO, &c, 1) == 1) return (unsigned char)c;
+    ULONGLONG start = GetTickCount64();
+    while ((long long)(GetTickCount64() - start) < (long long)ms) {
+        if (_kbhit()) return _getch();
+        Sleep(1);
     }
     return -1;
 }
@@ -112,16 +118,9 @@ static int t_clear_lines(int board[TH][TW]) {
 }
 
 static void play_tetris(void) {
-    struct termios orig, raw;
-    tcgetattr(STDIN_FILENO, &orig);
-    raw = orig;
-    raw.c_lflag &= ~(ICANON | ECHO);
-    raw.c_iflag &= ~(IXON | ICRNL);
-    raw.c_cc[VMIN]  = 0;
-    raw.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    enable_ansi();
 
-    printf("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+    printf("\x1b[2J\x1b[H\x1b[?25l");
     fflush(stdout);
 
     srand((unsigned)time(NULL));
@@ -139,28 +138,24 @@ static void play_tetris(void) {
     while (running && !game_over) {
         int c;
         while ((c = read_char_timeout(0)) >= 0) {
-            if (c == 27) {
+            if (c == 0 || c == 224) {
+                /* extended key: second byte is the scan code */
                 int c2 = read_char_timeout(20);
-                if (c2 == '[') {
-                    int c3 = read_char_timeout(20);
-                    if (c3 == 'A') {
-                        int nr = (cur_rot + 1) % 4;
-                        if (!t_collide(board, TETRIS_SHAPES[cur_type][nr], cur_x, cur_y))
-                            cur_rot = nr;
-                    } else if (c3 == 'B') {
-                        if (!t_collide(board, TETRIS_SHAPES[cur_type][cur_rot], cur_x, cur_y + 1))
-                            cur_y++;
-                    } else if (c3 == 'C') {
-                        if (!t_collide(board, TETRIS_SHAPES[cur_type][cur_rot], cur_x + 1, cur_y))
-                            cur_x++;
-                    } else if (c3 == 'D') {
-                        if (!t_collide(board, TETRIS_SHAPES[cur_type][cur_rot], cur_x - 1, cur_y))
-                            cur_x--;
-                    }
-                } else if (c2 < 0) {
-                    running = 0;
+                if (c2 == 72) {          /* Up    -> rotate */
+                    int nr = (cur_rot + 1) % 4;
+                    if (!t_collide(board, TETRIS_SHAPES[cur_type][nr], cur_x, cur_y))
+                        cur_rot = nr;
+                } else if (c2 == 80) {   /* Down  -> soft drop */
+                    if (!t_collide(board, TETRIS_SHAPES[cur_type][cur_rot], cur_x, cur_y + 1))
+                        cur_y++;
+                } else if (c2 == 77) {   /* Right */
+                    if (!t_collide(board, TETRIS_SHAPES[cur_type][cur_rot], cur_x + 1, cur_y))
+                        cur_x++;
+                } else if (c2 == 75) {   /* Left  */
+                    if (!t_collide(board, TETRIS_SHAPES[cur_type][cur_rot], cur_x - 1, cur_y))
+                        cur_x--;
                 }
-            } else if (c == 'q' || c == 'Q') {
+            } else if (c == 27 || c == 'q' || c == 'Q') {
                 running = 0;
             } else if (c == ' ') {
                 while (!t_collide(board, TETRIS_SHAPES[cur_type][cur_rot], cur_x, cur_y + 1))
@@ -196,7 +191,7 @@ static void play_tetris(void) {
         /* ---------- RENDER ---------- */
         const int (*shape)[4] = TETRIS_SHAPES[cur_type][cur_rot];
 
-        /* ghost: lowest reachable position of the current piece */
+        /* ghost: lowest reachable position */
         int ghost_y = cur_y;
         while (!t_collide(board, shape, cur_x, ghost_y + 1))
             ghost_y++;
@@ -205,12 +200,10 @@ static void play_tetris(void) {
         printf("========== BINARY TETRIS ==========\n");
         printf("Score: %-6d  Speed: %lldms\n\n", score, drop_interval);
 
-        /* column ruler */
         printf("   ");
         for (int x = 0; x < TW; x++) printf("%d ", x);
         printf("\n");
 
-        /* top border */
         printf("  +");
         for (int x = 0; x < TW; x++) printf("--");
         printf("+\n");
@@ -234,13 +227,13 @@ static void play_tetris(void) {
                     char ch = ((gy + gx) & 1) ? '1' : '0';
                     printf("\x1b[2;32m%c \x1b[0m", ch);
                 } else {
-                    printf("\x1b[2;37m· \x1b[0m");
+                    /* UTF-8 middle dot */
+                    printf("\x1b[2;37m\xC2\xB7 \x1b[0m");
                 }
             }
             printf("|\n");
         }
 
-        /* bottom border */
         printf("  +");
         for (int x = 0; x < TW; x++) printf("--");
         printf("+\n");
@@ -248,10 +241,9 @@ static void play_tetris(void) {
         printf("\nArrows: move/rotate | SPACE: drop | Q: quit\n");
         fflush(stdout);
 
-        usleep(16000);
+        Sleep(16);
     }
 
-    /* ---------- GAME OVER ---------- */
     printf("\x1b[2J\x1b[H");
     if (game_over) printf("========== GAME OVER ==========\n\n");
     else           printf("========== QUIT ==========\n\n");
@@ -259,14 +251,11 @@ static void play_tetris(void) {
     printf("Press any key to return to menu...\n");
     fflush(stdout);
 
-    tcflush(STDIN_FILENO, TCIFLUSH);
-    char dummy;
-    while (read(STDIN_FILENO, &dummy, 1) != 1) usleep(50000);
-    tcflush(STDIN_FILENO, TCIFLUSH);
+    while (!_kbhit()) Sleep(50);
+    while (_kbhit()) _getch();   /* drain every pending key/scan-code */
 
-    printf("\x1b[?25h\x1b[?1049l");
+    printf("\x1b[2J\x1b[H\x1b[?25h");
     fflush(stdout);
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
 }
 
 /* ============================================================
@@ -281,6 +270,8 @@ int main(void) {
     int result;
     int score;
     char answer[65];
+
+    enable_ansi();
 
     while (1) {
 
@@ -312,7 +303,12 @@ int main(void) {
         printf("0. Exit\n\n");
 
         printf("Choose: ");
-        scanf("%d", &choice);
+        if (scanf("%d", &choice) != 1) {
+            /* flush bad input */
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != EOF) {}
+            choice = -1;
+        }
 
         switch (choice) {
             case 1:
@@ -626,7 +622,7 @@ int main(void) {
 
             case 8:
                 printf(
-                "+------------+     ♪♫♪      27 + 15 = 42\n"
+                "+------------+     o o o      27 + 15 = 42\n"
                 "|\\          /|                x * y = z\n"
                 "| \\        / |                2^8 = 256\n"
                 "|  \\______/  |\n"
@@ -730,7 +726,8 @@ int main(void) {
                 {
                     printf("\nIncorrect symbol.\n\n");
 
-                    while (getchar() != '\n');
+                    int ch;
+                    while ((ch = getchar()) != '\n' && ch != EOF) {}
 
                     continue;
                 }
@@ -857,7 +854,7 @@ int main(void) {
 
             case 12:
                 play_tetris();
-                continue;   /* терминал уже восстановлен — не ждём двойной Enter */
+                continue;   /* terminal is already clean — skip double Enter */
 
             case 0:
                 printf(
@@ -884,7 +881,7 @@ int main(void) {
         }
 
         printf("\nPress Enter to return to menu...");
-        getchar(); // съедает Enter после scanf
-        getchar(); // ждет, пока пользователь нажмет Enter
+        getchar();  /* eat the \n left by scanf */
+        getchar();  /* wait for user to press Enter */
     }
 }
