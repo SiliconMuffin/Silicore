@@ -193,37 +193,65 @@ static void play_tetris(void) {
             }
         }
 
-        /* --- render --- */
+        /* ---------- RENDER ---------- */
+        const int (*shape)[4] = TETRIS_SHAPES[cur_type][cur_rot];
+
+        /* ghost: lowest reachable position of the current piece */
+        int ghost_y = cur_y;
+        while (!t_collide(board, shape, cur_x, ghost_y + 1))
+            ghost_y++;
+
         printf("\x1b[H");
         printf("========== BINARY TETRIS ==========\n");
         printf("Score: %-6d  Speed: %lldms\n\n", score, drop_interval);
-        printf("+----------+\n");
 
-        const int (*shape)[4] = TETRIS_SHAPES[cur_type][cur_rot];
+        /* column ruler */
+        printf("   ");
+        for (int x = 0; x < TW; x++) printf("%d ", x);
+        printf("\n");
+
+        /* top border */
+        printf("  +");
+        for (int x = 0; x < TW; x++) printf("--");
+        printf("+\n");
+
         for (int y = 0; y < TH; y++) {
-            printf("|");
+            printf("%2d|", y + 1);
             for (int x = 0; x < TW; x++) {
                 int sy = y - cur_y, sx = x - cur_x;
                 int falling = (sy >= 0 && sy < 4 && sx >= 0 && sx < 4 && shape[sy][sx]);
+
+                int gy = y - ghost_y, gx = x - cur_x;
+                int ghost = (!falling && gy >= 0 && gy < 4 && gx >= 0 && gx < 4 && shape[gy][gx]);
+
                 if (falling) {
                     char ch = ((sy + sx) & 1) ? '1' : '0';
-                    printf("\x1b[1;32m%c\x1b[0m", ch);
+                    printf("\x1b[1;32m%c \x1b[0m", ch);
                 } else if (board[y][x]) {
                     char ch = ((x + y) & 1) ? '1' : '0';
-                    printf("\x1b[36m%c\x1b[0m", ch);
+                    printf("\x1b[36m%c \x1b[0m", ch);
+                } else if (ghost) {
+                    char ch = ((gy + gx) & 1) ? '1' : '0';
+                    printf("\x1b[2;32m%c \x1b[0m", ch);
                 } else {
-                    printf(" ");
+                    printf("\x1b[2;37m· \x1b[0m");
                 }
             }
             printf("|\n");
         }
-        printf("+----------+\n");
+
+        /* bottom border */
+        printf("  +");
+        for (int x = 0; x < TW; x++) printf("--");
+        printf("+\n");
+
         printf("\nArrows: move/rotate | SPACE: drop | Q: quit\n");
         fflush(stdout);
 
         usleep(16000);
     }
 
+    /* ---------- GAME OVER ---------- */
     printf("\x1b[2J\x1b[H");
     if (game_over) printf("========== GAME OVER ==========\n\n");
     else           printf("========== QUIT ==========\n\n");
@@ -829,7 +857,7 @@ int main(void) {
 
             case 12:
                 play_tetris();
-                continue;   /* terminal уже восстановлен — не ждём двойной Enter */
+                continue;   /* терминал уже восстановлен — не ждём двойной Enter */
 
             case 0:
                 printf(
